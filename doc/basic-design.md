@@ -1,7 +1,7 @@
 # プレゼン同期アプリ 基本設計
 
 > ステータス: Draft
-> 最終更新: 2026-11-19
+> 最終更新: 2026-11-20
 > 要件定義: [requirements.md](./requirements.md)
 > 詳細設計: [detailed-design.md](./detailed-design.md)
 
@@ -339,6 +339,7 @@ OperatorまたはOwnerが「前へ」「次へ」を操作した場合、クラ�
 | PostgreSQLドライバー | pgx |
 | DBアクセスコード生成 | sqlc |
 | DBマイグレーション | goose |
+| 一時データ・Pub/Sub | Valkey |
 | リアルタイム通信 | WebSocket（coder/websocket） |
 | PDF保存 | Garage（S3互換オブジェクトストレージ） |
 | S3クライアント | AWS SDK for Go v2 |
@@ -364,23 +365,25 @@ OperatorまたはOwnerが「前へ」「次へ」を操作した場合、クラ�
 /doc            要件・設計
 ```
 
-### 7.4 PostgreSQLと将来のRedis導入
+### 7.4 PostgreSQLとValkey
 
 MVP:
 
 - User、OIDC Identity、SlideDeck、PdfVersion、権限、SessionをPostgreSQLへ保存する。
-- ログインセッションもPostgreSQLへ保存する。
+- ログインセッションはValkeyへ保存し、TTLで有効期限を管理する。
 - セッションの状態、現在スライド、最終操作時刻をPostgreSQLへ保存する。
+- セッション状態の更新通知をValkey Pub/Subへpublishする。
+- 各Goアプリケーションは通知をsubscribeし、自身にWebSocket接続しているクライアントへ配信する。
 - WebSocket接続そのものはGoプロセスのメモリ上で管理する。
-- 初期リリースではRedisを必須にしない。
+- Valkeyは通知と一時データに使用し、スライドセッションの永続データの正にはしない。
+- Pub/Subの通知を受信できなかった場合は、WebSocket再接続時にPostgreSQLから最新状態を取得して復旧する。
 
 将来:
 
-- ログインセッションをRedisへ移行できるよう、保存処理をインターフェースで分離する。
-- リアルタイムのセッション状態をRedisへ移行できるよう、状態の読み書きをセッション管理モジュールへ集約する。
-- Goアプリケーションを複数インスタンスに増やす場合、Redis Pub/Subなどを使用してWebSocketイベントをインスタンス間で共有する。
+- Goアプリケーションを複数インスタンスに増やしても、Valkey Pub/SubでWebSocketイベントを共有する。
+- 必要になった場合は、現在状態の読み取りキャッシュをValkeyへ追加する。
 - PostgreSQLはUser、SlideDeck、権限、PDFメタデータなど永続データの正とし続ける。
-- Redisはキャッシュ、一時状態、ログインセッション、リアルタイム配信に使用し、永続データの唯一の保存先にはしない。
+- Valkey Streamsなどによる操作履歴の永続化はMVPに含めない。
 
 ## 8. 画面設計
 
@@ -469,7 +472,7 @@ Operatorに表示する操作:
 | 2026-11-17 | MVPではWeb/APIとWebSocketを同じアプリケーションとして実装・デプロイする |
 | 2026-11-17 | フロントエンドはReact + TypeScript、バックエンドはGoを使用する |
 | 2026-11-17 | データベースにはPostgreSQLを使用し、PDFはS3互換ストレージへ保存する |
-| 2026-11-17 | MVPではRedisを使用せず、将来ログインセッション、リアルタイム状態、Pub/SubをRedisへ切り出す |
+| 2026-11-20 | ログインセッションをValkeyへ保存し、WebSocket更新通知にValkey Pub/Subを使用する |
 | 2026-11-17 | DBアクセスにはpgx + sqlcを使用し、ORMは使用しない |
 | 2026-11-17 | DBマイグレーションにはgooseを使用する |
 | 2026-11-17 | HTTPルーターにはchiを使用する |

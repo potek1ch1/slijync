@@ -1,7 +1,7 @@
 # プレゼン同期アプリ 詳細設計
 
 > ステータス: Draft（実装開始可能）
-> 最終更新: 2026-11-19
+> 最終更新: 2026-11-20
 > 要件定義: [requirements.md](./requirements.md)
 > 基本設計: [basic-design.md](./basic-design.md)
 
@@ -20,15 +20,15 @@ Browser (React SPA)
               ├─ Auth / Deck / Member
               ├─ Session / WebSocket Hub
               └─ PDF Storage
-                │              │
-                v              v
-           PostgreSQL        Garage
+            │       │          │
+            v       v          v
+       PostgreSQL  Valkey    Garage
 ```
 
-- Goは単一プロセス・単一インスタンスで開始する。
+- Goは単一プロセス・単一インスタンスでも動作し、Valkey Pub/Subにより複数インスタンスへ拡張可能とする。
 - PostgreSQLを永続データの正、GarageをPDF本体の保存先とする。
-- WebSocket接続と配信HubはGoプロセスのメモリで管理する。
-- Redisと複数GoインスタンスはMVP対象外とする。
+- ログインセッションとWebSocket更新通知にValkeyを使用する。
+- WebSocket接続とローカル配信Hubは各Goプロセスのメモリで管理する。
 
 ## 3. リポジトリ構成
 
@@ -86,21 +86,7 @@ Googleログイン時に検証済みメールアドレスと表示名を更新�
 
 `user_id` にindexを設定する。将来、1 Userへ複数プロバイダーを紐づけられる。
 
-### 4.4 login_sessions
-
-| カラム | 型 | 制約・用途 |
-|---|---|---|
-| id | uuid | PK、管理用 |
-| user_id | uuid | NOT NULL、FK users ON DELETE CASCADE |
-| token_hash | bytea | NOT NULL、UNIQUE |
-| expires_at | timestamptz | NOT NULL |
-| created_at / last_seen_at | timestamptz | NOT NULL |
-
-- Cookieには32 byteの暗号学的乱数をBase64URL化して保存する。
-- DBにはトークンそのものではなくSHA-256ハッシュを保存する。
-- 初期有効期限は7日、ログアウト時はレコードを削除する。
-
-### 4.5 slide_decks
+### 4.4 slide_decks
 
 | カラム | 型 | 制約・用途 |
 |---|---|---|
@@ -113,7 +99,7 @@ Googleログイン時に検証済みメールアドレスと表示名を更新�
 
 通常検索では `deleted_at IS NULL` を必須にする。現行PdfVersionが同じSlideDeckに属することはサービス層で保証する。削除後もSession URLの「削除済み」表示のためSlideDeckとSessionレコードは残す。
 
-### 4.6 pdf_versions
+### 4.5 pdf_versions
 
 | カラム | 型 | 制約・用途 |
 |---|---|---|
@@ -131,7 +117,7 @@ Googleログイン時に検証済みメールアドレスと表示名を更新�
 - キーは `decks/{slideDeckId}/versions/{pdfVersionId}.pdf` とする。
 - 現行版またはactive Sessionが参照する版は削除しない。
 
-### 4.7 slide_deck_members
+### 4.6 slide_deck_members
 
 | カラム | 型 | 制約・用途 |
 |---|---|---|
@@ -142,7 +128,7 @@ Googleログイン時に検証済みメールアドレスと表示名を更新�
 
 OwnerはOperator権限を包含する。最後のOwner削除禁止と自己削除禁止はトランザクション内で検証する。user_idにindexを設定する。
 
-### 4.8 sessions
+### 4.7 sessions
 
 | カラム | 型 | 制約・用途 |
 |---|---|---|
@@ -160,11 +146,38 @@ OwnerはOperator権限を包含する。最後のOwner削除禁止と自己削�
 - `(slide_deck_id, created_at DESC)` と、active行のlast_operated_atにindexを設定する。
 - 状態変更のたびにrevisionを増やし、クライアントで古い配信を無視する。
 
-### 4.9 排他制御
+### 4.8 排他制御
 
 Owner削除時はメンバー行を `FOR UPDATE` し、実行者がOwner、対象が本人以外、Ownerが2人以上であることを同一トランザクションで検証する。
 
 セッション操作時はSession行を `FOR UPDATE` し、active、権限、ページ範囲を検証してからページ、最終操作時刻、revisionを更新する。コミット後にWebSocket配信する。同時操作はDBで直列化され、最後にコミットされた有効操作が最終状態になる。
+
+### 4.9 Valkeyデータ設計
+
+ログインセッション:
+
+```text
+key:   slijync:login_session:{SHA-256(sessionToken)}
+value: {"user_id":"UUID","created_at":"RFC3339"}
+TTL:   LOGIN_SESSION_TTL（初期値7日）
+```
+
+- Cookieには32 byteの暗号学的乱数をBase64URL化したtokenを保存する。
+- ValkeyのkeyにはtokenそのものではなくSHA-256ハッシュを使う。
+- ログアウト時はkeyを削除し、期限切れはTTLにより自動削除する。
+- Valkey障害中は新規ログインと認証必須操作を失敗させる。匿名Viewerの閲覧は継続可能とする。
+
+Pub/Sub channel:
+
+```text
+slijync:session:{sessionId}
+```
+
+- PostgreSQLの更新をコミットした後、更新後の `session_state` をpublishする。
+- 各Goインスタンスは対象通知をsubscribeし、自身のローカルWebSocket接続へ配信する。
+- 通常のPub/Subは永続化・再送を保証しないため、PostgreSQLのSessionを状態の正とする。
+- 通知を取り逃したクライアントは、WebSocket再接続時のPostgreSQL最新状態で復旧する。
+- スライド操作や開催履歴をValkeyへ永続保存しない。
 
 ## 5. HTTP API
 
@@ -263,7 +276,7 @@ ServerからClient:
 
 waiting/endedではslideとpage_countをnullにする。削除済みはdeck.deleted=trueとしPDFを配信しない。クライアントは現在値以下のrevisionを無視する。
 
-操作拒否時は `operation_error` とrequest_id、code、messageを返す。DBコミット前には配信しない。配信失敗でDB更新は戻さず、再接続時の最新状態で回復する。送信が滞留する接続は切断する。
+操作拒否時は `operation_error` とrequest_id、code、messageを返す。DBコミット後にValkey Pub/Subへpublishし、各GoインスタンスのローカルHubから配信する。publish失敗でDB更新は戻さず、再接続時の最新状態で回復する。送信が滞留する接続は切断する。
 
 ## 7. 認証・認可
 
@@ -315,7 +328,8 @@ Garage削除失敗時はDeckを削除済みのままにし、PdfVersionを再清
 - 1分ごとに、activeかつ `last_operated_at <= now() - 30 minutes` のSessionを行ロック後に再判定して終了する。
 - ページ変更だけが30分タイマーをリセットする。接続、Ping、状態取得ではリセットしない。
 - コミット後に状態配信と旧PDF清掃を行う。
-- 期限切れlogin sessionと、現行・active参照のどちらでもないPdfVersionを清掃する。
+- login sessionの期限切れ削除はValkey TTLに任せる。
+- 現行・active参照のどちらでもないPdfVersionを清掃する。
 - 補償削除に失敗した孤立オブジェクトは構造化ログへ記録する。
 
 重複起動しても安全になるよう、条件付き更新と行ロックを使う。
@@ -334,7 +348,8 @@ Garage削除失敗時はDeckを削除済みのままにし、PdfVersionを再清
 APP_BASE_URL                  HTTP_ADDR
 DATABASE_URL                 GOOGLE_OIDC_CLIENT_ID
 GOOGLE_OIDC_CLIENT_SECRET    SESSION_COOKIE_SECRET
-LOGIN_SESSION_TTL            S3_ENDPOINT
+LOGIN_SESSION_TTL            VALKEY_URL
+VALKEY_KEY_PREFIX            S3_ENDPOINT
 S3_REGION                    S3_BUCKET
 S3_ACCESS_KEY_ID             S3_SECRET_ACCESS_KEY
 PDF_MAX_BYTES                PDF_MAX_PAGES
@@ -348,24 +363,24 @@ SESSION_IDLE_TIMEOUT
 - JSON構造化ログを標準出力へ出す。
 - HTTP request ID、WebSocket request_id、必要なUser/Deck/Session IDを含める。
 - Cookie、OIDC token、PDF内容、Garage secretは記録しない。
-- HTTPエラー数、WebSocket接続数、active Session数、Garage/DB失敗数を監視対象にする。
+- HTTPエラー数、WebSocket接続数、active Session数、Garage/DB/Valkey失敗数を監視対象にする。
 - 操作履歴はDB保存せず、MVPの障害調査はログで行う。
 
 ## 13. テスト方針
 
-- 単体: 認可、メール正規化、状態遷移、ページ範囲、PDF検証、Cookie token照合。
+- 単体: 認可、メール正規化、状態遷移、ページ範囲、PDF検証、Cookie tokenとValkey keyの生成。
 - DB統合: 最後のOwner・自己削除拒否、同時ページ操作、Session開始終了時のPDF参照、差し替え中の旧版固定、自動終了と清掃。
-- API/WebSocket: 匿名Viewer、権限別API、途中参加・再接続、同時操作後のrevision、各Session状態、Range PDF取得。
+- API/WebSocket: 匿名Viewer、権限別API、途中参加・再接続、Valkey Pub/Sub経由の配信、通知欠落後の復旧、同時操作後のrevision、各Session状態、Range PDF取得。
 - Frontend: 通常閲覧の独立性、状態別画面、権限別UI、自動再接続、page query正規化。
 
 ## 14. 実装順序
 
-1. リポジトリ、Compose、PostgreSQL、Garage、migration、sqlc
-2. Google OIDC、User、login session
+1. リポジトリ、Compose、PostgreSQL、Valkey、Garage、migration、sqlc
+2. Google OIDC、User、Valkey login session
 3. Deck作成、PDF保存、通常閲覧
 4. Owner/Operator管理
 5. Session作成・開始・終了
-6. WebSocket同期と競合制御
+6. WebSocket同期、Valkey Pub/Sub、競合制御
 7. 自動終了、PDF差し替え・清掃、Deck削除
 8. UI仕上げ、統合テスト、運用設定
 
@@ -386,5 +401,4 @@ SESSION_IDLE_TIMEOUT
 
 MVPの機能・データ・API設計に、実装開始を止める保留事項はない。
 
-将来検討として、Google以外のOIDC、Redis、複数アプリケーションインスタンス、アカウント統合、開催履歴、Viewer管理、非公開資料を残す。
-
+将来検討として、Google以外のOIDC、複数アプリケーションインスタンス、Valkeyによる読み取りキャッシュ、アカウント統合、開催履歴、Viewer管理、非公開資料を残す。
