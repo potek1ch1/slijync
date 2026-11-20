@@ -20,14 +20,14 @@ Browser (React SPA)
               ├─ Auth / Deck / Member
               ├─ Session / WebSocket Hub
               └─ PDF Storage
-            │       │          │
-            v       v          v
-       PostgreSQL  Valkey    Garage
+                    │          │
+                    v          v
+               PostgreSQL   Garage
 ```
 
-- Goは単一プロセス・単一インスタンスでも動作し、Valkey Pub/Subにより複数インスタンスへ拡張可能とする。
+- Goは単一プロセス・単一インスタンスから開始し、PostgreSQLのLISTEN / NOTIFYで複数インスタンスにも通知できる構成とする。
 - PostgreSQLを永続データの正、GarageをPDF本体の保存先とする。
-- ログインセッション、開催中のランタイム状態、WebSocket更新通知にValkeyを使用する。
+- ログインセッション、開催中のランタイム状態、WebSocket更新通知をPostgreSQLで管理する。
 - WebSocket接続とローカル配信Hubは各Goプロセスのメモリで管理する。
 
 ## 3. リポジトリ構成
@@ -144,52 +144,44 @@ OwnerはOperator権限を包含する。最後のOwner削除禁止と自己削�
 - `(slide_deck_id, created_at DESC)` にindexを設定する。
 - 現在ページ、revision、最終操作時刻は開催中だけ必要なため、このテーブルには保存しない。
 
-### 4.8 排他制御
+### 4.8 session_runtimes
+
+| カラム | 型 | 制約・用途 |
+|---|---|---|
+| session_id | uuid | PK、FK sessions ON DELETE CASCADE |
+| current_slide_number | integer | NOT NULL、1以上 |
+| revision | bigint | NOT NULL、1以上 |
+| last_operated_at | timestamptz | NOT NULL |
+| created_at / updated_at | timestamptz | NOT NULL |
+
+- Session開始・再開時に現在ページ1、revision 1で作成し、終了時に削除する。
+- `last_operated_at` にindexを設定し、30分無操作のSessionを検索する。
+- 開催履歴ではなく現在開催中の状態だけを表す。
+
+### 4.9 login_sessions
+
+| カラム | 型 | 制約・用途 |
+|---|---|---|
+| id | uuid | PK、管理用 |
+| user_id | uuid | NOT NULL、FK users ON DELETE CASCADE |
+| token_hash | bytea | NOT NULL、UNIQUE |
+| expires_at | timestamptz | NOT NULL |
+| created_at / last_seen_at | timestamptz | NOT NULL |
+
+- Cookieには32 byteの暗号学的乱数をBase64URL化して保存する。
+- DBにはtokenそのものではなくSHA-256ハッシュを保存する。
+- 初期有効期限は7日、ログアウト時はレコードを削除する。
+- `expires_at` にindexを設定する。
+
+### 4.10 排他制御と通知
 
 Owner削除時はメンバー行を `FOR UPDATE` し、実行者がOwner、対象が本人以外、Ownerが2人以上であることを同一トランザクションで検証する。
 
-セッションの開始・終了時はSession行を `FOR UPDATE` し、PostgreSQL上のライフサイクルと固定PDFを更新する。ページ操作はValkey上のランタイム状態に対してアトミックに実行する。
+セッションの開始・終了時はSession行を `FOR UPDATE` し、ライフサイクル、固定PDF、SessionRuntimeを同一トランザクションで更新する。
 
-### 4.9 Valkeyデータ設計
+ページ操作時はSessionRuntime行を `FOR UPDATE` し、active、権限、ページ範囲を検証して現在ページ、revision、最終操作時刻を更新する。同じトランザクション内で `pg_notify('session_updates', payload)` を呼び出す。NOTIFYはコミット後にだけ配信されるため、未コミット状態はWebSocketへ流れない。
 
-ログインセッション:
-
-```text
-key:   slijync:login_session:{SHA-256(sessionToken)}
-value: {"user_id":"UUID","created_at":"RFC3339"}
-TTL:   LOGIN_SESSION_TTL（初期値7日）
-```
-
-- Cookieには32 byteの暗号学的乱数をBase64URL化したtokenを保存する。
-- ValkeyのkeyにはtokenそのものではなくSHA-256ハッシュを使う。
-- ログアウト時はkeyを削除し、期限切れはTTLにより自動削除する。
-- Valkey障害中は新規ログインと認証必須操作を失敗させる。匿名Viewerの閲覧は継続可能とする。
-
-Pub/Sub channel:
-
-```text
-slijync:session:{sessionId}
-```
-
-- 開催中のランタイム状態は次のHashへ保存する。
-
-```text
-key: slijync:session_runtime:{sessionId}
-
-current_slide     3
-page_count        20
-revision          12
-last_operated_at  1795147200
-```
-
-- 自動終了期限はSorted Set `slijync:session_deadlines` に、session IDをmember、終了予定Unix時刻をscoreとして保存する。
-- セッション開始時に現在ページ1、revision 1、ページ数、最終操作時刻を初期化する。
-- ページ操作時はLua scriptで権限検証後のページ範囲確認、現在ページ更新、revision加算、最終操作時刻更新、終了期限更新、publishをアトミックに行う。
-- Viewerによるread、WebSocket接続、Ping/Pongでは最終操作時刻と終了期限を延長しない。
-- 各Goインスタンスは更新後の `session_state` をsubscribeし、自身のローカルWebSocket接続へ配信する。
-- 通常のPub/Subは永続化・再送を保証しないが、最新状態はValkey Hashから再取得できる。
-- PostgreSQLでactiveなのにRuntime Hashが存在しない場合はSessionをendedへ変更し、同じURLから再開可能にする。
-- Valkey AOFを有効にして通常の再起動による状態消失を抑えるが、開催履歴としては扱わない。
+各Goインスタンスは通常のクエリ用poolとは別にLISTEN専用接続を1本維持する。通知payloadにはsession IDとrevisionを含め、受信側はSessionRuntimeを再取得してローカルWebSocket接続へ配信する。通知を取り逃しても、再接続時の再取得で復旧する。
 
 ## 5. HTTP API
 
@@ -252,9 +244,9 @@ last_operated_at  1795147200
 | POST | `/api/sessions/{session_id}/end` | Operator以上 | 終了 |
 | GET | `/api/public/sessions/{session_id}/pdf` | 公開 | active時の固定PDF |
 
-開始時はDeckとSessionをロックし、PostgreSQLで現行PDFを固定してstatusをactive、started_atを現在時刻にする。コミット後、Valkeyへページ1のRuntimeと30分後の終了期限を作成する。Valkey初期化に失敗した場合はPostgreSQLをendedへ補償更新する。activeを再開始した場合は `409 session_already_active` とする。
+開始時はDeckとSessionをロックし、現行PDFを固定してstatusをactive、started_atを現在時刻にし、ページ1のSessionRuntimeを作成する。すべて同じPostgreSQLトランザクションで実行する。activeを再開始した場合は `409 session_already_active` とする。
 
-終了時はPostgreSQLのstatusをended、PDF参照をNULLにする。waitingの終了も許可する。コミット後にValkeyのRuntimeと終了期限を削除し、終了状態の配信と不要な旧PDF清掃を行う。
+終了時はstatusをended、PDF参照をNULLにし、SessionRuntimeを削除してNOTIFYを発行する。waitingの終了も許可する。コミット後に終了状態を配信し、不要な旧PDFを清掃する。
 
 ## 6. WebSocket
 
@@ -288,7 +280,7 @@ ServerからClient:
 
 waiting/endedではslideとpage_countをnullにする。削除済みはdeck.deleted=trueとしPDFを配信しない。クライアントは現在値以下のrevisionを無視する。
 
-操作拒否時は `operation_error` とrequest_id、code、messageを返す。ページ操作はValkey Lua scriptでRuntime更新とpublishをまとめて実行する。通知を取り逃しても再接続時にRuntime Hashから最新状態を取得する。送信が滞留する接続は切断する。
+操作拒否時は `operation_error` とrequest_id、code、messageを返す。ページ操作はSessionRuntime更新とNOTIFYを同じPostgreSQLトランザクションで実行する。通知を取り逃しても再接続時にSessionRuntimeから最新状態を取得する。送信が滞留する接続は切断する。
 
 ## 7. 認証・認可
 
@@ -337,11 +329,11 @@ Garage削除失敗時はDeckを削除済みのままにし、PdfVersionを再清
 
 ## 9. 定期処理
 
-- 1分ごとにValkeyの `slijync:session_deadlines` から期限到来Sessionを取得する。
-- Runtime Hashの最終操作時刻と期限を再確認してから、PostgreSQLのSessionを行ロックして終了する。
+- 1分ごとに `session_runtimes.last_operated_at <= now() - 30 minutes` のSessionを検索する。
+- SessionとSessionRuntimeを行ロックして最終操作時刻を再確認してから終了する。
 - ページ変更だけが30分タイマーをリセットする。接続、Ping、状態取得ではリセットしない。
 - コミット後に状態配信と旧PDF清掃を行う。
-- login sessionの期限切れ削除はValkey TTLに任せる。
+- 期限切れlogin sessionをPostgreSQLから定期削除する。
 - 現行・active参照のどちらでもないPdfVersionを清掃する。
 - 補償削除に失敗した孤立オブジェクトは構造化ログへ記録する。
 
@@ -361,8 +353,7 @@ Garage削除失敗時はDeckを削除済みのままにし、PdfVersionを再清
 APP_BASE_URL                  HTTP_ADDR
 DATABASE_URL                 GOOGLE_OIDC_CLIENT_ID
 GOOGLE_OIDC_CLIENT_SECRET    SESSION_COOKIE_SECRET
-LOGIN_SESSION_TTL            VALKEY_URL
-VALKEY_KEY_PREFIX            S3_ENDPOINT
+LOGIN_SESSION_TTL            S3_ENDPOINT
 S3_REGION                    S3_BUCKET
 S3_ACCESS_KEY_ID             S3_SECRET_ACCESS_KEY
 PDF_MAX_BYTES                PDF_MAX_PAGES
@@ -376,24 +367,24 @@ SESSION_IDLE_TIMEOUT
 - JSON構造化ログを標準出力へ出す。
 - HTTP request ID、WebSocket request_id、必要なUser/Deck/Session IDを含める。
 - Cookie、OIDC token、PDF内容、Garage secretは記録しない。
-- HTTPエラー数、WebSocket接続数、active Session数、Garage/DB/Valkey失敗数を監視対象にする。
+- HTTPエラー数、WebSocket接続数、active Session数、Garage/DB失敗数、LISTEN接続状態を監視対象にする。
 - 操作履歴はDB保存せず、MVPの障害調査はログで行う。
 
 ## 13. テスト方針
 
-- 単体: 認可、メール正規化、状態遷移、ページ範囲、PDF検証、Cookie token、Valkey key、Lua script。
-- DB/Valkey統合: 最後のOwner・自己削除拒否、同時ページ操作、Session開始終了時のPDF参照、Runtime生成削除、差し替え中の旧版固定、自動終了と清掃。
-- API/WebSocket: 匿名Viewer、権限別API、途中参加・再接続、Valkey Pub/Sub経由の配信、通知欠落後のHash復旧、同時操作後のrevision、Runtime消失時の終了、Range PDF取得。
+- 単体: 認可、メール正規化、状態遷移、ページ範囲、PDF検証、Cookie token。
+- DB統合: 最後のOwner・自己削除拒否、同時ページ操作、Session開始終了時のPDF参照、Runtime生成削除、NOTIFY、差し替え中の旧版固定、自動終了と清掃。
+- API/WebSocket: 匿名Viewer、権限別API、途中参加・再接続、LISTEN / NOTIFY経由の配信、通知欠落後のDB復旧、同時操作後のrevision、Range PDF取得。
 - Frontend: 通常閲覧の独立性、状態別画面、権限別UI、自動再接続、page query正規化。
 
 ## 14. 実装順序
 
-1. リポジトリ、Compose、PostgreSQL、Valkey、Garage、migration、sqlc
-2. Google OIDC、User、Valkey login session
+1. リポジトリ、Compose、PostgreSQL、Garage、migration、sqlc
+2. Google OIDC、User、PostgreSQL login session
 3. Deck作成、PDF保存、通常閲覧
 4. Owner/Operator管理
 5. Session作成・開始・終了
-6. WebSocket同期、Valkey Pub/Sub、競合制御
+6. WebSocket同期、LISTEN / NOTIFY、競合制御
 7. 自動終了、PDF差し替え・清掃、Deck削除
 8. UI仕上げ、統合テスト、運用設定
 
@@ -414,4 +405,4 @@ SESSION_IDLE_TIMEOUT
 
 MVPの機能・データ・API設計に、実装開始を止める保留事項はない。
 
-将来検討として、Google以外のOIDC、複数アプリケーションインスタンス、アカウント統合、開催履歴、Viewer管理、非公開資料を残す。
+将来検討として、Google以外のOIDC、Valkey、より大規模な複数アプリケーションインスタンス、アカウント統合、開催履歴、Viewer管理、非公開資料を残す。

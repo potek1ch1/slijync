@@ -20,7 +20,9 @@
 | SlideDeck | スライド資料のタイトルや状態 |
 | PdfVersion | アップロードされたPDFの各バージョン |
 | SlideDeckMember | SlideDeckに対するOwner・Operator権限 |
-| Session | 同期プレゼンの状態、URL、現在スライド |
+| Session | 同期プレゼンのURL、ライフサイクル、固定PDF |
+| SessionRuntime | 開催中だけ存在する現在スライド、revision、最終操作時刻 |
+| LoginSession | サーバー側ログインセッション |
 
 ### 2.2 ID方針
 
@@ -144,15 +146,36 @@ UserがSlideDeckに対して持つ権限を表す。
 - `id` は独立したUUIDv4とし、セッション専用URLに使用する。
 - Sessionは開催履歴ではなく、同じURLで繰り返し利用する同期ルームとして扱う。
 - 過去の開催、操作、使用PDFバージョンを記録する履歴エンティティは作成しない。
-- セッション開始・再開時にValkey上の現在ページを1へ戻す。
+- セッション開始・再開時にSessionRuntimeを作成し、現在ページを1へ戻す。
 - 開始・再開時に現行の `PdfVersion` を `pdf_version_id` へ固定する。
 - SlideDeckに現行PdfVersionが存在しない場合、セッションを開始・再開できない。
-- Operatorの「前へ」「次へ」でValkey上の最終操作時刻と自動終了期限を更新する。
-- Valkey上の最終操作時刻から30分間操作がなければ、PostgreSQLのSessionを `ended` にする。
+- Operatorの「前へ」「次へ」でSessionRuntimeの最終操作時刻を更新する。
+- SessionRuntimeの最終操作時刻から30分間操作がなければSessionを `ended` にする。
 - セッション終了時に `pdf_version_id` を `null` にし、過去に使用したPDFバージョンとの対応履歴は保持しない。
 - 終了したSessionには、同じURLで再開するための `id`、`slide_deck_id`、状態などの最小情報だけを保持する。
 - セッション再開時は、その時点の現行PdfVersionを改めて固定する。
 - Viewerの接続情報は保存しない。
+
+### 2.9 SessionRuntime
+
+開催中だけ存在する一時的な状態をSession本体から分離して表す。
+
+想定フィールド:
+
+- `session_id`
+- `current_slide_number`
+- `revision`
+- `last_operated_at`
+- `created_at`
+- `updated_at`
+
+- Session開始・再開時に1行作成し、終了時に削除する。
+- ページ操作時に現在ページ、revision、最終操作時刻を同一トランザクションで更新する。
+- 行更新と同じトランザクションでPostgreSQLの `NOTIFY` を発行する。
+
+### 2.10 LoginSession
+
+ログインセッションをPostgreSQLへ保存する。有効期限切れのレコードは定期処理で削除する。
 
 ## 3. データライフサイクル
 
@@ -250,8 +273,9 @@ OperatorまたはOwnerが「前へ」「次へ」を操作した場合、クラ�
 1. 送信者が対象SlideDeckのOperatorまたはOwnerであることを検証する。
 2. Sessionが `active` であることを検証する。
 3. `slide` が1以上かつ開催中のPdfVersionのページ数以下であることを検証する。
-4. 検証に成功した場合、Valkey上の現在ページとrevisionをアトミックに更新する。
-5. Valkey上の最終操作時刻と自動終了期限を更新し、30分の無操作タイマーをリセットする。
+4. 検証に成功した場合、SessionRuntimeの現在ページとrevisionを更新する。
+5. SessionRuntimeの最終操作時刻を更新し、30分の無操作タイマーをリセットする。
+6. 同じトランザクションでPostgreSQLの `NOTIFY` を発行する。
 6. 更新後の現在スライドを、接続中の全クライアントへ配信する。
 
 ### 5.3 競合
@@ -337,7 +361,7 @@ OperatorまたはOwnerが「前へ」「次へ」を操作した場合、クラ�
 | PostgreSQLドライバー | pgx |
 | DBアクセスコード生成 | sqlc |
 | DBマイグレーション | goose |
-| 一時データ・Pub/Sub | Valkey |
+| 更新通知 | PostgreSQL LISTEN / NOTIFY |
 | リアルタイム通信 | WebSocket（coder/websocket） |
 | PDF保存 | Garage（S3互換オブジェクトストレージ） |
 | S3クライアント | AWS SDK for Go v2 |
@@ -363,26 +387,24 @@ OperatorまたはOwnerが「前へ」「次へ」を操作した場合、クラ�
 /doc            要件・設計
 ```
 
-### 7.4 PostgreSQLとValkey
+### 7.4 PostgreSQLによるMVP構成
 
 MVP:
 
 - User、OIDC Identity、SlideDeck、PdfVersion、権限、SessionをPostgreSQLへ保存する。
-- ログインセッションはValkeyへ保存し、TTLで有効期限を管理する。
+- ログインセッションはPostgreSQLへ保存する。
 - セッションのURL、ライフサイクル状態、開催中に固定するPDFバージョンをPostgreSQLへ保存する。
-- 開催中の現在スライド、revision、最終操作時刻、自動終了期限をValkeyへ保存する。
-- セッション状態の更新通知をValkey Pub/Subへpublishする。
-- 各Goアプリケーションは通知をsubscribeし、自身にWebSocket接続しているクライアントへ配信する。
+- 開催中の現在スライド、revision、最終操作時刻をPostgreSQLのSessionRuntimeへ保存する。
+- SessionRuntimeの更新と同じトランザクションで `NOTIFY` を発行する。
+- 各Goアプリケーションは専用接続で `LISTEN` し、自身にWebSocket接続しているクライアントへ配信する。
 - WebSocket接続そのものはGoプロセスのメモリ上で管理する。
-- Valkeyは開催中だけ必要なランタイム状態と通知に使用する。
-- Pub/Subの通知を受信できなかった場合は、WebSocket再接続時にValkeyから最新の開催中状態を取得して復旧する。
-- PostgreSQLでactiveなのにValkey上のランタイム状態が失われている場合は、そのSessionを終了扱いにする。
+- 通知を受信できなかった場合は、WebSocket再接続時にSessionRuntimeから最新状態を取得して復旧する。
 
 将来:
 
-- Goアプリケーションを複数インスタンスに増やしても、Valkey Pub/SubでWebSocketイベントを共有する。
+- ページ更新頻度、ログインセッション数、通知量がPostgreSQLへ影響する段階でValkeyを導入する。
+- SessionRuntimeStoreとEventPublisherをインターフェース化し、Valkeyへ差し替えられる構造にする。
 - PostgreSQLはUser、SlideDeck、権限、PDFメタデータなど永続データの正とし続ける。
-- Valkey Streamsなどによる操作履歴の永続化はMVPに含めない。
 
 ## 8. 画面設計
 
@@ -473,6 +495,7 @@ Operatorに表示する操作:
 | 2026-11-17 | データベースにはPostgreSQLを使用し、PDFはS3互換ストレージへ保存する |
 | 2026-11-20 | ログインセッションをValkeyへ保存し、WebSocket更新通知にValkey Pub/Subを使用する |
 | 2026-11-21 | 開催中の現在ページ、revision、最終操作時刻、自動終了期限をValkeyで管理する |
+| 2026-11-21 | MVPはPostgreSQLのみとし、SessionRuntimeとLISTEN / NOTIFYで開催中状態と通知を管理する |
 | 2026-11-17 | DBアクセスにはpgx + sqlcを使用し、ORMは使用しない |
 | 2026-11-17 | DBマイグレーションにはgooseを使用する |
 | 2026-11-17 | HTTPルーターにはchiを使用する |
