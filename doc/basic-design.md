@@ -1,7 +1,7 @@
 # プレゼン同期アプリ 基本設計
 
 > ステータス: Draft
-> 最終更新: 2026-11-20
+> 最終更新: 2026-11-21
 > 要件定義: [requirements.md](./requirements.md)
 > 詳細設計: [detailed-design.md](./detailed-design.md)
 
@@ -134,10 +134,8 @@ UserがSlideDeckに対して持つ権限を表す。
 - `slide_deck_id`
 - `pdf_version_id`: 開催中のみ設定し、終了時は `null`
 - `status`: `waiting`、`active`、`ended`
-- `current_slide_number`
 - `created_by_user_id`
 - `started_at`
-- `last_operated_at`
 - `created_at`
 - `updated_at`
 
@@ -146,11 +144,11 @@ UserがSlideDeckに対して持つ権限を表す。
 - `id` は独立したUUIDv4とし、セッション専用URLに使用する。
 - Sessionは開催履歴ではなく、同じURLで繰り返し利用する同期ルームとして扱う。
 - 過去の開催、操作、使用PDFバージョンを記録する履歴エンティティは作成しない。
-- セッション開始・再開時に `current_slide_number` を1へ戻す。
+- セッション開始・再開時にValkey上の現在ページを1へ戻す。
 - 開始・再開時に現行の `PdfVersion` を `pdf_version_id` へ固定する。
 - SlideDeckに現行PdfVersionが存在しない場合、セッションを開始・再開できない。
-- Operatorの「前へ」「次へ」で `last_operated_at` を更新する。
-- `last_operated_at` から30分間操作がなければ `ended` にする。
+- Operatorの「前へ」「次へ」でValkey上の最終操作時刻と自動終了期限を更新する。
+- Valkey上の最終操作時刻から30分間操作がなければ、PostgreSQLのSessionを `ended` にする。
 - セッション終了時に `pdf_version_id` を `null` にし、過去に使用したPDFバージョンとの対応履歴は保持しない。
 - 終了したSessionには、同じURLで再開するための `id`、`slide_deck_id`、状態などの最小情報だけを保持する。
 - セッション再開時は、その時点の現行PdfVersionを改めて固定する。
@@ -252,8 +250,8 @@ OperatorまたはOwnerが「前へ」「次へ」を操作した場合、クラ�
 1. 送信者が対象SlideDeckのOperatorまたはOwnerであることを検証する。
 2. Sessionが `active` であることを検証する。
 3. `slide` が1以上かつ開催中のPdfVersionのページ数以下であることを検証する。
-4. 検証に成功した場合、Sessionの `current_slide_number` を更新する。
-5. `last_operated_at` を更新し、30分の無操作タイマーをリセットする。
+4. 検証に成功した場合、Valkey上の現在ページとrevisionをアトミックに更新する。
+5. Valkey上の最終操作時刻と自動終了期限を更新し、30分の無操作タイマーをリセットする。
 6. 更新後の現在スライドを、接続中の全クライアントへ配信する。
 
 ### 5.3 競合
@@ -371,17 +369,18 @@ MVP:
 
 - User、OIDC Identity、SlideDeck、PdfVersion、権限、SessionをPostgreSQLへ保存する。
 - ログインセッションはValkeyへ保存し、TTLで有効期限を管理する。
-- セッションの状態、現在スライド、最終操作時刻をPostgreSQLへ保存する。
+- セッションのURL、ライフサイクル状態、開催中に固定するPDFバージョンをPostgreSQLへ保存する。
+- 開催中の現在スライド、revision、最終操作時刻、自動終了期限をValkeyへ保存する。
 - セッション状態の更新通知をValkey Pub/Subへpublishする。
 - 各Goアプリケーションは通知をsubscribeし、自身にWebSocket接続しているクライアントへ配信する。
 - WebSocket接続そのものはGoプロセスのメモリ上で管理する。
-- Valkeyは通知と一時データに使用し、スライドセッションの永続データの正にはしない。
-- Pub/Subの通知を受信できなかった場合は、WebSocket再接続時にPostgreSQLから最新状態を取得して復旧する。
+- Valkeyは開催中だけ必要なランタイム状態と通知に使用する。
+- Pub/Subの通知を受信できなかった場合は、WebSocket再接続時にValkeyから最新の開催中状態を取得して復旧する。
+- PostgreSQLでactiveなのにValkey上のランタイム状態が失われている場合は、そのSessionを終了扱いにする。
 
 将来:
 
 - Goアプリケーションを複数インスタンスに増やしても、Valkey Pub/SubでWebSocketイベントを共有する。
-- 必要になった場合は、現在状態の読み取りキャッシュをValkeyへ追加する。
 - PostgreSQLはUser、SlideDeck、権限、PDFメタデータなど永続データの正とし続ける。
 - Valkey Streamsなどによる操作履歴の永続化はMVPに含めない。
 
@@ -473,6 +472,7 @@ Operatorに表示する操作:
 | 2026-11-17 | フロントエンドはReact + TypeScript、バックエンドはGoを使用する |
 | 2026-11-17 | データベースにはPostgreSQLを使用し、PDFはS3互換ストレージへ保存する |
 | 2026-11-20 | ログインセッションをValkeyへ保存し、WebSocket更新通知にValkey Pub/Subを使用する |
+| 2026-11-21 | 開催中の現在ページ、revision、最終操作時刻、自動終了期限をValkeyで管理する |
 | 2026-11-17 | DBアクセスにはpgx + sqlcを使用し、ORMは使用しない |
 | 2026-11-17 | DBマイグレーションにはgooseを使用する |
 | 2026-11-17 | HTTPルーターにはchiを使用する |
