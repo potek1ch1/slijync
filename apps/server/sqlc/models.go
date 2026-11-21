@@ -3,3 +3,84 @@
 //   sqlc v1.30.0
 
 package db
+
+import (
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+type LoginSession struct {
+	ID         pgtype.UUID        `json:"id"`
+	UserID     pgtype.UUID        `json:"user_id"`
+	TokenHash  []byte             `json:"token_hash"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	LastSeenAt pgtype.Timestamptz `json:"last_seen_at"`
+}
+
+type OidcIdentity struct {
+	ID        pgtype.UUID        `json:"id"`
+	UserID    pgtype.UUID        `json:"user_id"`
+	Issuer    string             `json:"issuer"`
+	Subject   string             `json:"subject"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PdfVersion struct {
+	ID              pgtype.UUID        `json:"id"`
+	SlideDeckID     pgtype.UUID        `json:"slide_deck_id"`
+	VersionNumber   int32              `json:"version_number"`
+	StorageKey      string             `json:"storage_key"`
+	PageCount       int32              `json:"page_count"`
+	FileSizeBytes   int64              `json:"file_size_bytes"`
+	Sha256          []byte             `json:"sha256"`
+	CreatedByUserID pgtype.UUID        `json:"created_by_user_id"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type Session struct {
+	ID              pgtype.UUID        `json:"id"`
+	SlideDeckID     pgtype.UUID        `json:"slide_deck_id"`
+	PdfVersionID    pgtype.UUID        `json:"pdf_version_id"`
+	Status          string             `json:"status"`
+	CreatedByUserID pgtype.UUID        `json:"created_by_user_id"`
+	StartedAt       pgtype.Timestamptz `json:"started_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type SessionRuntime struct {
+	SessionID          pgtype.UUID        `json:"session_id"`
+	CurrentSlideNumber int32              `json:"current_slide_number"`
+	Revision           int64              `json:"revision"`
+	LastOperatedAt     pgtype.Timestamptz `json:"last_operated_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type SlideDeck struct {
+	ID                  pgtype.UUID        `json:"id"`
+	Title               string             `json:"title"`
+	CurrentPdfVersionID pgtype.UUID        `json:"current_pdf_version_id"`
+	CreatedByUserID     pgtype.UUID        `json:"created_by_user_id"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	DeletedAt           pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type SlideDeckMember struct {
+	SlideDeckID     pgtype.UUID        `json:"slide_deck_id"`
+	UserID          pgtype.UUID        `json:"user_id"`
+	Role            string             `json:"role"`
+	CreatedByUserID pgtype.UUID        `json:"created_by_user_id"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type User struct {
+	ID              pgtype.UUID        `json:"id"`
+	Email           string             `json:"email"`
+	NormalizedEmail string             `json:"normalized_email"`
+	DisplayName     string             `json:"display_name"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}

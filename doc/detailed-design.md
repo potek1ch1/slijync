@@ -63,6 +63,73 @@ doc/
 - Viewer、接続、スライド操作、開催履歴のテーブルは作らない。
 - 論理削除はSlideDeckだけに使う。
 
+### 4.1.1 ER図
+
+```mermaid
+erDiagram
+    users ||--o{ oidc_identities : "ログイン手段"
+    users ||--o{ login_sessions : "ログイン状態"
+    users ||--o{ slide_deck_members : "権限を持つ"
+    slide_decks ||--|{ slide_deck_members : "Owner / Operator"
+    slide_decks ||--o{ pdf_versions : "PDFを差し替える"
+    slide_decks o|--o| pdf_versions : "現在のPDF"
+    slide_decks ||--o{ sessions : "複数回開催できる"
+    pdf_versions ||--o{ sessions : "開始時のPDFを固定"
+    sessions ||--o| session_runtimes : "開催中だけ存在"
+
+    users {
+        uuid id PK
+        text normalized_email UK
+        text display_name
+    }
+    oidc_identities {
+        uuid id PK
+        uuid user_id FK
+        text issuer
+        text subject
+    }
+    login_sessions {
+        uuid id PK
+        uuid user_id FK
+        bytea token_hash UK
+        timestamptz expires_at
+    }
+    slide_decks {
+        uuid id PK
+        varchar title
+        uuid current_pdf_version_id FK
+        uuid created_by_user_id FK
+        timestamptz deleted_at
+    }
+    pdf_versions {
+        uuid id PK
+        uuid slide_deck_id FK
+        int version_number
+        text storage_key UK
+        int page_count
+    }
+    slide_deck_members {
+        uuid slide_deck_id PK,FK
+        uuid user_id PK,FK
+        text role "owner / operator"
+    }
+    sessions {
+        uuid id PK
+        uuid slide_deck_id FK
+        uuid pdf_version_id FK
+        text status "waiting / active / ended"
+        timestamptz started_at
+    }
+    session_runtimes {
+        uuid session_id PK,FK
+        int current_slide_number
+        bigint revision
+        timestamptz last_operated_at
+    }
+```
+
+`created_by_user_id` も `users.id` を参照するが、図が過密になるため関係線は省略している。
+
 ### 4.2 users
 
 | カラム | 型 | 制約・用途 |
