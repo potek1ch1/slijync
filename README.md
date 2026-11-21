@@ -25,6 +25,25 @@ docker compose up --build
 
 `migrate`サービスはPostgreSQLの起動後に未適用のgoose migrationだけを実行し、正常終了する。`server`はmigrationの正常終了後に起動する。
 
+## migrationの追加
+
+適用済みmigrationは変更せず、新しい連番ファイルを追加する。
+
+```text
+db/migrations/000002_create_initial_schema.sql
+db/migrations/000003_add_example_column.sql
+```
+
+追加後は次を実行する。
+
+```bash
+make migrate
+```
+
+開発環境では`db/migrations`をmigrationコンテナへread-only mountしているため、イメージを再ビルドしなくても新しいSQLが読み込まれる。gooseは`goose_db_version`を確認し、未適用ファイルだけを順番に実行する。
+
+すでに適用したmigrationを開発中に作り直す必要がある場合は、通常はDownして書き換えるのではなく、新しいmigrationで修正する。DB volumeを削除する操作は全ローカルデータを失うため、明示的に初期化するときだけ行う。
+
 ## よく使うコマンド
 
 ```bash
@@ -50,4 +69,3 @@ doc           要件・設計
 ## 設定
 
 開発用の初期値は`.env.example`にある。本番ではCookie secret、DB password、Garage credentialsを必ず変更する。
-

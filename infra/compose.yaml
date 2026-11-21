@@ -50,6 +50,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - ../db/migrations:/migrations:ro
     restart: "no"
 
   server:
@@ -95,4 +97,3 @@ volumes:
   postgres-data:
   garage-meta:
   garage-data:
-
