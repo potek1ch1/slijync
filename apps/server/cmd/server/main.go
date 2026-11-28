@@ -11,10 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/potek1ch1/slijync/apps/server/internal/config"
 	"github.com/potek1ch1/slijync/apps/server/internal/httpapi"
+	db "github.com/potek1ch1/slijync/apps/server/sqlc"
 )
 
 func main() {
@@ -40,21 +42,37 @@ func run(logger *slog.Logger) error {
 	}
 
 	ctx := context.Background()
-	db, err := pgxpool.New(ctx, cfg.DatabaseURL)
+
+	googleOAuth2Config, err := config.NewGoogleOAuth2Config(cfg)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	providerCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	provider, err := oidc.NewProvider(providerCtx, "https://accounts.google.com")
+	if err != nil {
+		return fmt.Errorf("initialize Google OIDC provider: %w", err)
+	}
+
+	googleOIDC := config.NewGoogleOIDC(googleOAuth2Config, provider)
+
+	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return fmt.Errorf("create database pool: %w", err)
 	}
-	defer db.Close()
+	defer dbPool.Close()
 
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := db.Ping(pingCtx); err != nil {
+	if err := dbPool.Ping(pingCtx); err != nil {
 		return fmt.Errorf("connect database: %w", err)
 	}
 
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewRouter(db, logger),
+		Handler:           httpapi.NewRouter(dbPool, db.New(dbPool), logger, googleOIDC, cfg),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

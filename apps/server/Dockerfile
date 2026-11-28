@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine AS build
+FROM golang:1.27.4-alpine AS build
 
 WORKDIR /src
 COPY apps/server/go.mod apps/server/go.sum ./
@@ -11,4 +11,3 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/server /server
 EXPOSE 8080
 ENTRYPOINT ["/server"]
-

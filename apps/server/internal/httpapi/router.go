@@ -9,29 +9,31 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/potek1ch1/slijync/apps/server/internal/config"
+	db "github.com/potek1ch1/slijync/apps/server/sqlc"
 )
 
-type database interface {
-	Ping(context.Context) error
-}
-
-func NewRouter(db database, logger *slog.Logger) http.Handler {
+func NewRouter(dbPool *pgxpool.Pool, queries *db.Queries, logger *slog.Logger, googleOIDC config.GoogleOIDC, cfg config.Config) http.Handler {
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
 	router.Use(middleware.Recoverer)
 	router.Use(requestLogger(logger))
 
-	router.Get("/api/health", healthHandler(db))
+	router.Get("/api/health", healthHandler(queries))
+	router.Get("/api/auth/google/start", handleRedirect(googleOIDC, cfg))
+	router.Get("/api/auth/google/callback", handleCallback(dbPool, queries, googleOIDC, logger, cfg))
+
 	return router
 }
 
-func healthHandler(db database) http.HandlerFunc {
+func healthHandler(queries *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		if err := db.Ping(ctx); err != nil {
+		if _, err := queries.HealthCheck(ctx); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy"})
 			return
 		}
